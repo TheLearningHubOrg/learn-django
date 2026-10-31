@@ -1,14 +1,19 @@
+import re
+
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
 
 from .models import Book
 
+# Nine digits plus a digit or "X" check character (ISBN-10), or thirteen digits (ISBN-13).
+ISBN_PATTERN = re.compile(r"\d{9}[\dX]|\d{13}", re.ASCII)
+
 
 class ISBNField(serializers.CharField):
-    """Strips hyphens before validators run, so length and uniqueness see the stored form."""
+    """Strips hyphens and spaces before validators run, so length and uniqueness see the stored form."""
 
     def to_internal_value(self, data):
-        return super().to_internal_value(data).replace("-", "")
+        return super().to_internal_value(data).replace("-", "").replace(" ", "").upper()
 
 
 class BookSerializer(serializers.ModelSerializer):
@@ -24,7 +29,6 @@ class BookSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "owner", "created_at"]
 
     def validate_isbn(self, value: str) -> str:
-        # ISBN-10 may end in "X"; every other character must be a digit.
-        if len(value) not in (10, 13) or not value[:-1].isdigit():
+        if not ISBN_PATTERN.fullmatch(value):
             raise serializers.ValidationError("ISBN must have 10 or 13 digits.")
         return value

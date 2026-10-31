@@ -55,11 +55,20 @@ def test_authenticated_create_sets_owner_and_cleans_isbn(api_client, alice):
     assert book.isbn == "9780441013593"
 
 
-def test_invalid_isbn_is_rejected(api_client, alice):
+@pytest.mark.parametrize("isbn", ["123", "978044101359Z", "X123456789", "12345678901"])
+def test_invalid_isbn_is_rejected(api_client, alice, isbn):
     api_client.force_authenticate(user=alice)
-    response = api_client.post(BOOKS_URL, {"title": "T", "author": "A", "isbn": "123"}, format="json")
+    response = api_client.post(BOOKS_URL, {"title": "T", "author": "A", "isbn": isbn}, format="json")
     assert response.status_code == 400
     assert "isbn" in response.json()
+
+
+def test_isbn10_with_check_character_x_is_accepted(api_client, alice):
+    api_client.force_authenticate(user=alice)
+    payload = {"title": "T", "author": "A", "isbn": "0-8044-2957-x"}
+    response = api_client.post(BOOKS_URL, payload, format="json")
+    assert response.status_code == 201
+    assert Book.objects.get().isbn == "080442957X"
 
 
 def test_duplicate_isbn_is_rejected_even_with_hyphens(api_client, alice):

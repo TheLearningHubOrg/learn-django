@@ -2,6 +2,8 @@
 import os
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -11,7 +13,11 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 # 1. Core security switches
 DEBUG = env_bool("DJANGO_DEBUG", default=True)
-SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-only-insecure-key-change-me")
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "")
+if not SECRET_KEY:
+    if not DEBUG:
+        raise ImproperlyConfigured("DJANGO_SECRET_KEY must be set when DJANGO_DEBUG is off.")
+    SECRET_KEY = "dev-only-insecure-key-change-me"
 ALLOWED_HOSTS = [h for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if h]
 
 # 2. Applications
@@ -55,7 +61,9 @@ TEMPLATES = [
     },
 ]
 
-# 3. Database: SQLite locally, PostgreSQL when DATABASE_NAME is set
+# 3. Database: SQLite locally, PostgreSQL when DATABASE_NAME is set.
+# The app is served over ASGI, where persistent connections (CONN_MAX_AGE > 0) are
+# not recommended, so PostgreSQL uses psycopg's built-in pool instead.
 if os.environ.get("DATABASE_NAME"):
     DATABASES = {
         "default": {
@@ -65,8 +73,7 @@ if os.environ.get("DATABASE_NAME"):
             "PASSWORD": os.environ.get("DATABASE_PASSWORD", ""),
             "HOST": os.environ.get("DATABASE_HOST", "localhost"),
             "PORT": os.environ.get("DATABASE_PORT", "5432"),
-            "CONN_MAX_AGE": 60,
-            "CONN_HEALTH_CHECKS": True,
+            "OPTIONS": {"pool": {"min_size": 1, "max_size": 5}},
         }
     }
 else:

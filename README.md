@@ -199,13 +199,21 @@ Read every secret from the environment. The companion project does this with a t
 # src/config/settings.py (excerpt)
 import os
 
+from django.core.exceptions import ImproperlyConfigured
+
 def env_bool(name: str, default: bool = False) -> bool:
     return os.environ.get(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
 
 DEBUG = env_bool("DJANGO_DEBUG", default=True)
-SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-only-insecure-key-change-me")
-ALLOWED_HOSTS = [h for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost").split(",") if h]
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "")
+if not SECRET_KEY:
+    if not DEBUG:
+        raise ImproperlyConfigured("DJANGO_SECRET_KEY must be set when DJANGO_DEBUG is off.")
+    SECRET_KEY = "dev-only-insecure-key-change-me"
+ALLOWED_HOSTS = [h for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if h]
 ```
+
+The development fallback key exists only so `runserver` works out of the box. With debug off, a missing key stops the process at startup instead of silently signing sessions with a value that is public on GitHub.
 
 ### 1.4 URL Routing, Function Views & Templates
 
@@ -539,13 +547,17 @@ from django.core.exceptions import ValidationError
 
 
 class BookForm(forms.ModelForm):
+    # Override the generated field: the model's max_length=13 would reject
+    # "978-0-441-01359-3" before clean_isbn() ever got to strip the hyphens.
+    isbn = forms.CharField(max_length=20)
+
     class Meta:
         model = Book
         fields = ["title", "isbn", "status", "price_cents"]
 
     def clean_isbn(self):
-        isbn = self.cleaned_data["isbn"].replace("-", "")
-        if not isbn.isdigit() or len(isbn) not in (10, 13):
+        isbn = self.cleaned_data["isbn"].replace("-", "").replace(" ", "")
+        if not isbn.isascii() or not isbn.isdigit() or len(isbn) not in (10, 13):
             raise ValidationError("Enter a 10 or 13 digit ISBN.")
         return isbn
 
@@ -556,7 +568,7 @@ class BookForm(forms.ModelForm):
         return cleaned
 ```
 
-`ModelForm` also calls `Model.full_clean()` validation for the fields it includes, so model-level validators and unique checks surface as form errors instead of database exceptions.
+`ModelForm` also runs the model's own validation (`Model.full_clean()` and `validate_unique()`) for the fields it includes, after the form's `clean_*()` methods. Model validators and unique checks therefore see the normalised ISBN and surface as form errors instead of database exceptions. The `isascii()` check matters because `str.isdigit()` also accepts characters such as superscript digits.
 
 ### 3.4 Customising the Admin for Operations Teams
 
@@ -622,15 +634,22 @@ class RequestIdMiddleware:
 A serializer does two jobs: it turns model instances into primitive data (`to_representation`) and it validates incoming data into Python values (`to_internal_value`). `ModelSerializer` generates fields and validators from the model, including `UniqueValidator` for unique columns.
 
 ```python
+import re
+
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
+
+from .models import Book
+
+# Nine digits plus a digit or "X" check character (ISBN-10), or thirteen digits (ISBN-13).
+ISBN_PATTERN = re.compile(r"\d{9}[\dX]|\d{13}", re.ASCII)
 
 
 class ISBNField(serializers.CharField):
     """Normalise before validators run, so length and uniqueness see the stored form."""
 
     def to_internal_value(self, data):
-        return super().to_internal_value(data).replace("-", "")
+        return super().to_internal_value(data).replace("-", "").replace(" ", "").upper()
 
 
 class BookSerializer(serializers.ModelSerializer):
@@ -643,7 +662,7 @@ class BookSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "owner", "created_at"]
 
     def validate_isbn(self, value: str) -> str:
-        if len(value) not in (10, 13) or not value[:-1].isdigit():
+        if not ISBN_PATTERN.fullmatch(value):
             raise serializers.ValidationError("ISBN must have 10 or 13 digits.")
         return value
 ```
@@ -654,7 +673,7 @@ Validation order inside DRF:
 
 1. Field `to_internal_value()`, then the field's `validators`.
 2. `validate_<field>()` methods.
-3. `validate(self, attrs)` for cross-field rules, then serializer-level `Meta.validators`.
+3. Serializer-level validators (`Meta.validators`, including any `UniqueTogetherValidator` that `ModelSerializer` generates), then `validate(self, attrs)` for cross-field rules.
 
 ### 4.2 ViewSets, Routers & Custom Actions
 
@@ -859,7 +878,7 @@ AUTHENTICATION_BACKENDS = [
 ]
 ```
 
-`authenticate()` tries each backend in order until one returns a user. A custom backend lets users sign in with an email address:
+`authenticate()` tries each backend in order until one returns a user. A custom backend lets users sign in with an email address. The `unique=True` on `email` is case-sensitive, so the backend refuses to guess when two accounts differ only by case; store emails lowercased, or add `UniqueConstraint(Lower("email"), name="user_email_ci_unique")`, to rule that out:
 
 ```python
 # accounts/backends.py
@@ -872,7 +891,7 @@ class EmailBackend(ModelBackend):
         User = get_user_model()
         try:
             user = User.objects.get(email__iexact=username)
-        except User.DoesNotExist:
+        except (User.DoesNotExist, User.MultipleObjectsReturned):
             User().set_password(password)   # equalise timing to resist user enumeration
             return None
         if user.check_password(password) and self.user_can_authenticate(user):
@@ -967,7 +986,7 @@ SECURE_CSP = {
 }
 ```
 
-Roll out a new policy with `SECURE_CSP_REPORT_ONLY` first, watch the violation reports, then enforce it.
+To use the nonce in templates, add `"django.template.context_processors.csp"` to the template `context_processors` and write `<script nonce="{{ csp_nonce }}">`. Roll out a new policy with `SECURE_CSP_REPORT_ONLY` first, watch the violation reports, then enforce it.
 
 ---
 
@@ -1058,6 +1077,7 @@ Anything slower than a few hundred milliseconds (emails, PDF rendering, webhooks
 
 ```python
 # catalog/tasks.py
+from django.contrib.auth import get_user_model
 from django.core.mail import send_mail
 from django.tasks import task
 
@@ -1081,10 +1101,11 @@ Task arguments must be JSON-serialisable, so pass primary keys, not model instan
 ### 6.4 Production Settings & `check --deploy`
 
 ```bash
-DJANGO_DEBUG=false DJANGO_SECRET_KEY=x python manage.py check --deploy
+export DJANGO_SECRET_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(50))')"
+DJANGO_DEBUG=false python manage.py check --deploy
 ```
 
-`check --deploy` flags missing HSTS, insecure cookies, `DEBUG=True` and more. The companion project switches hardening on whenever debug is off:
+`check --deploy` flags missing HSTS, insecure cookies, `DEBUG=True`, a short or weak `SECRET_KEY` and more. On the companion project it leaves two deliberate warnings, `SECURE_HSTS_INCLUDE_SUBDOMAINS` and `SECURE_HSTS_PRELOAD`, because both commit every subdomain to HTTPS and should be a conscious choice. The project switches hardening on whenever debug is off:
 
 ```python
 if not DEBUG:
@@ -1127,7 +1148,8 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY manage.py .
 COPY src ./src
-RUN DJANGO_SECRET_KEY=build-only python manage.py collectstatic --noinput
+RUN DJANGO_SECRET_KEY=build-only python manage.py collectstatic --noinput \
+    && chown app:app /app
 USER app
 
 EXPOSE 8000
@@ -1173,7 +1195,7 @@ LOGGING = {
 
 Each Django process holds its own database connections. With 3 workers per pod and 20 pods, that is $3 \times 20 = 60$ processes, and with a pool of 5 per process up to $60 \times 5 = 300$ server connections. Two options:
 
-1. **Native pool** (Django 5.1+ with psycopg 3): set `"OPTIONS": {"pool": {"min_size": 2, "max_size": 5}}` and leave `CONN_MAX_AGE` at `0`, because pooling and persistent connections cannot be combined.
+1. **Native pool** (Django 5.1+ with `psycopg[pool]`): set `"OPTIONS": {"pool": {"min_size": 1, "max_size": 5}}` and leave `CONN_MAX_AGE` at `0`, because pooling and persistent connections cannot be combined. The companion project's PostgreSQL settings do exactly this. It is also the right choice under ASGI, where Django advises against persistent connections.
 2. **External pooler**: PgBouncer in transaction mode in front of PostgreSQL, with `DISABLE_SERVER_SIDE_CURSORS = True` because server-side cursors do not survive transaction pooling.
 
 For tracing and metrics, OpenTelemetry's Django instrumentation captures request spans and database calls with little code, and Sentry or a similar tool catches unhandled exceptions with request context.
@@ -1202,7 +1224,10 @@ pytest -q
 # 5. Container
 docker build -t learn-django .
 docker run -p 8000:8000 -e DJANGO_SECRET_KEY=change-me -e DJANGO_ALLOWED_HOSTS=localhost -e DJANGO_SSL_REDIRECT=false learn-django
+curl http://localhost:8000/health/
 ```
+
+Without `DATABASE_NAME` the container falls back to a throwaway SQLite file, which is enough for the health check. For real use, pass the `DATABASE_*` variables for PostgreSQL and run `python manage.py migrate` as a one-off job with the same image. The image serves the API only; add WhiteNoise or a CDN before you rely on the admin's static files in production.
 
 ---
 

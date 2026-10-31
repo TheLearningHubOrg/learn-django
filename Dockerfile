@@ -27,7 +27,7 @@ COPY --from=builder /opt/venv /opt/venv
 COPY manage.py .
 COPY src ./src
 
-RUN DJANGO_SECRET_KEY=build-only python manage.py collectstatic --noinput
+RUN DJANGO_SECRET_KEY=build-only python manage.py collectstatic --noinput \n    && chown app:app /app
 USER app
 
 EXPOSE 8000
