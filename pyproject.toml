@@ -1,0 +1,27 @@
+[project]
+name = "learn-django"
+version = "1.0.0"
+description = "Companion project for the Learn Django masterclass guide"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "The Learning Hub" }]
+requires-python = ">=3.12"
+dependencies = [
+    "Django>=5.2,<7",
+    "djangorestframework>=3.16",
+    "gunicorn>=23",
+    "uvicorn>=0.30",
+    "uvicorn-worker>=0.3",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "pytest-django>=4.9",
+]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings"
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
